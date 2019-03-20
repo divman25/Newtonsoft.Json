@@ -119,7 +119,7 @@ namespace Newtonsoft.Json.Serialization
         [Obsolete("DefaultMembersSearchFlags is obsolete. To modify the members serialized inherit from DefaultContractResolver and override the GetSerializableMembers method instead.")]
         public BindingFlags DefaultMembersSearchFlags { get; set; }
 #else
-        private BindingFlags DefaultMembersSearchFlags;
+        private readonly BindingFlags DefaultMembersSearchFlags;
 #endif
 
         /// <summary>
@@ -198,6 +198,25 @@ namespace Newtonsoft.Json.Serialization
             return _contractCache.Get(type);
         }
 
+        private static bool FilterMembers(MemberInfo member)
+        {
+            if (member is PropertyInfo property)
+            {
+                if (ReflectionUtils.IsIndexedProperty(property))
+                {
+                    return false;
+                }
+
+                return !ReflectionUtils.IsByRefLikeType(property.PropertyType);
+            }
+            else if (member is FieldInfo field)
+            {
+                return !ReflectionUtils.IsByRefLikeType(field.FieldType);
+            }
+
+            return true;
+        }
+
         /// <summary>
         /// Gets the serializable members for the type.
         /// </summary>
@@ -215,7 +234,7 @@ namespace Newtonsoft.Json.Serialization
             MemberSerialization memberSerialization = JsonTypeReflector.GetObjectMemberSerialization(objectType, ignoreSerializableAttribute);
 
             IEnumerable<MemberInfo> allMembers = ReflectionUtils.GetFieldsAndProperties(objectType, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
-                .Where(m => !ReflectionUtils.IsIndexedProperty(m));
+                .Where(FilterMembers);
 
             List<MemberInfo> serializableMembers = new List<MemberInfo>();
 
@@ -227,7 +246,7 @@ namespace Newtonsoft.Json.Serialization
 
 #pragma warning disable 618
                 List<MemberInfo> defaultMembers = ReflectionUtils.GetFieldsAndProperties(objectType, DefaultMembersSearchFlags)
-                    .Where(m => !ReflectionUtils.IsIndexedProperty(m)).ToList();
+                    .Where(FilterMembers).ToList();
 #pragma warning restore 618
 
                 foreach (MemberInfo member in allMembers)
@@ -267,13 +286,18 @@ namespace Newtonsoft.Json.Serialization
                 }
 
 #if HAVE_DATA_CONTRACTS
-                Type match;
                 // don't include EntityKey on entities objects... this is a bit hacky
-                if (objectType.AssignableToTypeName("System.Data.Objects.DataClasses.EntityObject", false, out match))
+                if (objectType.AssignableToTypeName("System.Data.Objects.DataClasses.EntityObject", false, out _))
                 {
                     serializableMembers = serializableMembers.Where(ShouldSerializeEntityMember).ToList();
                 }
 #endif
+                // don't include TargetSite on non-serializable exceptions
+                // MemberBase is problematic to serialize. Large, self referencing instances, etc
+                if (typeof(Exception).IsAssignableFrom(objectType))
+                {
+                    serializableMembers = serializableMembers.Where(m => !string.Equals(m.Name, "TargetSite", StringComparison.Ordinal)).ToList();
+                }
             }
             else
             {
@@ -293,8 +317,7 @@ namespace Newtonsoft.Json.Serialization
 #if HAVE_DATA_CONTRACTS
         private bool ShouldSerializeEntityMember(MemberInfo memberInfo)
         {
-            PropertyInfo propertyInfo = memberInfo as PropertyInfo;
-            if (propertyInfo != null)
+            if (memberInfo is PropertyInfo propertyInfo)
             {
                 if (propertyInfo.PropertyType.IsGenericType() && propertyInfo.PropertyType.GetGenericTypeDefinition().FullName == "System.Data.Objects.DataClasses.EntityReference`1")
                 {
@@ -496,15 +519,15 @@ namespace Newtonsoft.Json.Serialization
                  ? JsonTypeReflector.ReflectionDelegateFactory.CreateSet<object>(member)
                  : null;
                 Func<object> createExtensionDataDictionary = JsonTypeReflector.ReflectionDelegateFactory.CreateDefaultConstructor<object>(createdType);
-                MethodInfo addMethod = t.GetMethod("Add", new[] { keyType, valueType });
-                if (addMethod == null)
+                MethodInfo setMethod = t.GetProperty("Item", BindingFlags.Public | BindingFlags.Instance, null, valueType, new[] { keyType }, null)?.GetSetMethod();
+                if (setMethod == null)
                 {
-                    // Add is explicitly implemented and non-public
+                    // Item is explicitly implemented and non-public
                     // get from dictionary interface
-                    addMethod = dictionaryType.GetMethod("Add", new[] {keyType, valueType});
+                    setMethod = dictionaryType.GetProperty("Item", BindingFlags.Public | BindingFlags.Instance, null, valueType, new[] { keyType }, null)?.GetSetMethod();
                 }
 
-                MethodCall<object, object> setExtensionDataDictionaryValue = JsonTypeReflector.ReflectionDelegateFactory.CreateMethodCall<object>(addMethod);
+                MethodCall<object, object> setExtensionDataDictionaryValue = JsonTypeReflector.ReflectionDelegateFactory.CreateMethodCall<object>(setMethod);
 
                 ExtensionDataSetter extensionDataSetter = (o, key, value) =>
                 {
